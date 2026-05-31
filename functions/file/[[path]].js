@@ -39,6 +39,23 @@ export async function onRequest(context) {  // Contents of context object
     const url = new URL(request.url);
     context.url = url;
 
+    // 解析图片处理参数
+    const w = url.searchParams.get('w') || url.searchParams.get('width');
+    const h = url.searchParams.get('h') || url.searchParams.get('height');
+    const q = url.searchParams.get('q') || url.searchParams.get('quality');
+    const f = url.searchParams.get('f') || url.searchParams.get('format');
+    const raw = url.searchParams.get('raw') === 'true';
+    const token = url.searchParams.get('token');
+
+    // 校验内部安全 Token（针对防盗链的 raw 提取）
+    if (raw && token) {
+        const secret = env.JWT_SECRET || env.TG_BOT_TOKEN || 'cfbed_default_secret';
+        const expectedToken = await generateSignature(fileId, secret);
+        if (token === expectedToken) {
+            context.bypassReferrerCheck = true;
+        }
+    }
+
     const Referer = request.headers.get('Referer')
     context.Referer = Referer;
 
@@ -69,6 +86,37 @@ export async function onRequest(context) {  // Contents of context object
     let accessRes = await returnWithCheck(context, imgRecord);
     if (accessRes.status !== 200) {
         return accessRes; // 如果不可访问，直接返回
+    }
+
+    // 检查是否有动态裁剪或优化参数，且当前不是内部 raw 请求
+    if ((w || h || q || f) && !raw) {
+        const secret = env.JWT_SECRET || env.TG_BOT_TOKEN || 'cfbed_default_secret';
+        const internalToken = await generateSignature(fileId, secret);
+
+        // 构造带有防盗链签名的内部 raw URL
+        const rawUrl = new URL(request.url);
+        rawUrl.searchParams.set('raw', 'true');
+        rawUrl.searchParams.set('token', internalToken);
+
+        // 使用免费、高性能且运行在 CF 边缘网络上的 wsrv.nl 服务进行裁剪
+        const wsrvUrl = `https://wsrv.nl/?url=${encodeURIComponent(rawUrl.toString())}&w=${w || ''}&h=${h || ''}&q=${q || 80}&output=${f || 'webp'}&fit=cover`;
+
+        // 使用 fetch 代理请求以保持域一致并享受 Cloudflare CDN 缓存
+        const wsrvRes = await fetch(wsrvUrl, {
+            headers: {
+                'User-Agent': request.headers.get('User-Agent') || 'Mozilla/5.0'
+            }
+        });
+
+        // 响应头设置
+        const headers = new Headers(wsrvRes.headers);
+        setCommonHeaders(headers, encodedFileName, f ? `image/${f}` : 'image/webp', getFileCacheControl(context));
+
+        return new Response(wsrvRes.body, {
+            status: wsrvRes.status,
+            statusText: wsrvRes.statusText,
+            headers
+        });
     }
 
     /* Cloudflare R2渠道 */
@@ -1006,4 +1054,13 @@ async function handleWebDAVFile(context, metadata, encodedFileName, fileType) {
     } catch (error) {
         return new Response(`Error: Failed to fetch from WebDAV - ${error.message}`, { status: 500 });
     }
+}
+
+// 生成基于 Web Crypto API 的安全 Token 签名，用于防盗链情况下的内部 raw 请求校验
+async function generateSignature(fileId, secret) {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(fileId + ":" + secret);
+    const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
 }

@@ -2,6 +2,9 @@
 
 // 判断请求域名是否在允许的域名列表中
 export function isDomainAllowed(context) {
+    if (context.bypassReferrerCheck) {
+        return true;
+    }
     const { Referer, securityConfig, url } = context;
 
     const allowedDomains = securityConfig.access.allowedDomains;
